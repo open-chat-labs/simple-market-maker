@@ -1,0 +1,8 @@
+.dfx/
+target/
+
+**/*.rs.bk
+
+.DS_Store
+**/*.env
+**/*.pem
