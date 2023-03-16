@@ -2,7 +2,7 @@ use candid::Principal;
 use ic_agent::agent::http_transport::ReqwestHttpReplicaV2Transport;
 use ic_agent::identity::BasicIdentity;
 use ic_agent::Agent;
-use simple_market_maker::{Config, ICDex};
+use simple_market_maker::{log, Config, ICDex};
 use std::time::Duration;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -33,11 +33,14 @@ async fn main() -> Result<(), Error> {
         min_order_size: 1000000,
         max_buy_price: 8000000,
         min_sell_price: 4000000,
-        max_orders_per_direction: 100,
+        min_orders_per_direction: 5,
+        max_orders_per_direction: 10,
         max_orders_to_make_per_iteration: 10,
         max_orders_to_cancel_per_iteration: 10,
         iteration_interval: Duration::from_secs(5),
     };
+
+    log("Initialization complete");
 
     simple_market_maker::run(&icdex, &config).await;
     Ok(())

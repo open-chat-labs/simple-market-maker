@@ -1,8 +1,14 @@
 use async_trait::async_trait;
+use candid::utils::ArgumentEncoder;
+use candid::{CandidType, Principal};
+use chrono::Local;
+use ic_agent::Agent;
 use itertools::Itertools;
+use serde::de::DeserializeOwned;
 use std::cmp::Reverse;
 use std::collections::btree_map::Entry::Occupied;
 use std::collections::{BTreeMap, HashSet};
+use std::fmt::Debug;
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -22,12 +28,14 @@ pub struct Config {
     pub min_order_size: u64,
     pub max_buy_price: u64,
     pub min_sell_price: u64,
+    pub min_orders_per_direction: u64,
     pub max_orders_per_direction: u64,
     pub max_orders_to_make_per_iteration: usize,
     pub max_orders_to_cancel_per_iteration: usize,
     pub iteration_interval: Duration,
 }
 
+#[derive(Debug)]
 pub struct Stats {
     latest_price: u64,
     open_orders: Vec<Order>,
@@ -39,6 +47,7 @@ pub enum OrderType {
     Ask,
 }
 
+#[derive(Debug)]
 pub struct Order {
     order_type: OrderType,
     id: String,
@@ -46,41 +55,61 @@ pub struct Order {
     amount: u64,
 }
 
+#[derive(Clone, Debug)]
 pub struct MakeOrderRequest {
     order_type: OrderType,
     price: u64,
     amount: u64,
 }
 
+#[derive(Debug)]
 pub struct CancelOrderRequest {
     id: String,
 }
 
 pub async fn run<E: Exchange>(exchange: &E, config: &Config) {
     loop {
-        let _ = run_once(exchange, config).await;
+        log("Starting iteration");
+        if let Err(msg) = run_once(exchange, config).await {
+            log(&format!("Error: {msg}"));
+        }
 
         sleep(config.iteration_interval).await;
     }
 }
 
+pub fn log(message: &str) {
+    println!("{} {message}", Local::now().format("%Y-%m-%d %H:%M:%S"));
+}
+
 async fn run_once<E: Exchange>(exchange: &E, config: &Config) -> Result<(), String> {
     let stats = exchange.stats().await?;
 
-    let target_orders = build_orders(stats.latest_price, config);
+    let (required_orders, optional_orders) = build_orders(stats.latest_price, config);
 
     let orders_to_cancel = calculate_orders_to_cancel(
         &stats.open_orders,
-        &target_orders,
+        Vec::from_iter(required_orders.clone().into_iter().chain(optional_orders)),
+        stats.latest_price,
         config.max_orders_to_cancel_per_iteration,
+        config.increment,
     );
 
     let orders_to_make = calculate_orders_to_make(
         &stats.open_orders,
-        target_orders,
+        required_orders,
         config.min_order_size,
         config.max_orders_to_make_per_iteration,
+        config.increment,
     );
+
+    log(&format!(
+        "Latest price: {}. Open orders: {}. Orders to make: {}. Orders to cancel: {}",
+        stats.latest_price,
+        stats.open_orders.len(),
+        orders_to_make.len(),
+        orders_to_cancel.len()
+    ));
 
     futures::future::try_join(
         exchange.make_orders(orders_to_make),
@@ -96,6 +125,7 @@ fn calculate_orders_to_make(
     target_orders: Vec<MakeOrderRequest>,
     min_order_size: u64,
     max_orders_to_make: usize,
+    increment: u64,
 ) -> Vec<MakeOrderRequest> {
     let mut bids_to_make = BTreeMap::new();
     let mut asks_to_make = BTreeMap::new();
@@ -108,8 +138,12 @@ fn calculate_orders_to_make(
 
     for order in open_orders {
         if let Occupied(mut e) = match order.order_type {
-            OrderType::Bid => bids_to_make.entry(order.price),
-            OrderType::Ask => asks_to_make.entry(order.price),
+            OrderType::Bid => {
+                bids_to_make.entry(round_to_nearest_increment(order.price, increment))
+            }
+            OrderType::Ask => {
+                asks_to_make.entry(round_to_nearest_increment(order.price, increment))
+            }
         } {
             let entry = e.get_mut();
             entry.amount = entry.amount.saturating_sub(order.amount);
@@ -129,8 +163,10 @@ fn calculate_orders_to_make(
 
 fn calculate_orders_to_cancel(
     open_orders: &[Order],
-    target_orders: &[MakeOrderRequest],
+    target_orders: Vec<MakeOrderRequest>,
+    latest_price: u64,
     max_orders_to_cancel: usize,
+    increment: u64,
 ) -> Vec<CancelOrderRequest> {
     let mut target_bid_prices = HashSet::new();
     let mut target_ask_prices = HashSet::new();
@@ -146,12 +182,18 @@ fn calculate_orders_to_cancel(
     for order in open_orders {
         match order.order_type {
             OrderType::Bid => {
-                if !target_bid_prices.contains(&order.price) {
+                if order.price < latest_price
+                    && !target_bid_prices
+                        .contains(&round_to_nearest_increment(order.price, increment))
+                {
                     bids.push(order);
                 }
             }
             OrderType::Ask => {
-                if !target_ask_prices.contains(&order.price) {
+                if order.price > latest_price
+                    && !target_ask_prices
+                        .contains(&round_to_nearest_increment(order.price, increment))
+                {
                     asks.push(order);
                 }
             }
@@ -168,29 +210,93 @@ fn calculate_orders_to_cancel(
         .collect()
 }
 
-fn build_orders(latest_price: u64, config: &Config) -> Vec<MakeOrderRequest> {
+fn build_orders(
+    latest_price: u64,
+    config: &Config,
+) -> (Vec<MakeOrderRequest>, Vec<MakeOrderRequest>) {
     let starting_bid = starting_bid(latest_price, config.increment);
     let starting_ask = starting_ask(latest_price, config.increment);
 
     let bids = (0..config.max_orders_per_direction)
-        .map(|i| starting_bid - (i * config.increment))
-        .skip_while(|p| *p <= config.max_buy_price)
+        .map(|i| starting_bid.saturating_sub(i * config.increment))
+        .take_while(|p| *p > 0)
+        .skip_while(|p| *p >= config.max_buy_price)
         .map(|p| MakeOrderRequest {
             order_type: OrderType::Bid,
             price: p,
             amount: config.order_size,
-        });
+        })
+        .enumerate()
+        .map(|(i, o)| (o, (i as u64) < config.min_orders_per_direction));
 
     let asks = (0..config.max_orders_per_direction)
-        .map(|i| starting_ask + (i * config.increment))
-        .skip_while(|p| *p >= config.min_sell_price)
+        .map(|i| starting_ask.saturating_add(i * config.increment))
+        .skip_while(|p| *p <= config.min_sell_price)
         .map(|p| MakeOrderRequest {
             order_type: OrderType::Ask,
             price: p,
             amount: config.order_size,
-        });
+        })
+        .enumerate()
+        .map(|(i, o)| (o, (i as u64) < config.min_orders_per_direction));
 
-    Vec::from_iter(bids.chain(asks))
+    let mut required_orders = Vec::new();
+    let mut optional_orders = Vec::new();
+    for (order, required) in bids.chain(asks) {
+        if required {
+            required_orders.push(order);
+        } else {
+            optional_orders.push(order);
+        }
+    }
+    (required_orders, optional_orders)
+}
+
+fn round_to_nearest_increment(original: u64, increment: u64) -> u64 {
+    ((original + (increment / 2)) / increment) * increment
+}
+
+async fn query<A: ArgumentEncoder + Debug, R: CandidType + DeserializeOwned>(
+    agent: &Agent,
+    canister_id: &Principal,
+    method_name: &str,
+    args: A,
+) -> Result<R, String> {
+    agent
+        .query(canister_id, method_name)
+        .with_arg(candid::encode_args(args).unwrap())
+        .call()
+        .await
+        .map(|r| candid::decode_one::<R>(&r).unwrap())
+        .map_err(|e| e.to_string())
+}
+
+async fn update_no_response<A: ArgumentEncoder + Debug>(
+    agent: &Agent,
+    canister_id: &Principal,
+    method_name: &str,
+    args: A,
+) -> Result<(), String> {
+    update(agent, canister_id, method_name, args).await
+}
+
+async fn update<A: ArgumentEncoder + Debug, R: CandidType + DeserializeOwned>(
+    agent: &Agent,
+    canister_id: &Principal,
+    method_name: &str,
+    args: A,
+) -> Result<R, String> {
+    log(&format!(
+        "Starting update call - {method_name}. Args - {args:?}"
+    ));
+    let bytes = agent
+        .update(canister_id, method_name)
+        .with_arg(candid::encode_args(args).unwrap())
+        .call_and_wait()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(candid::decode_one(&bytes).unwrap())
 }
 
 fn starting_bid(latest_price: u64, increment: u64) -> u64 {
@@ -205,21 +311,6 @@ fn starting_ask(latest_price: u64, increment: u64) -> u64 {
 mod tests {
     use super::*;
     use test_case::test_case;
-
-    #[test]
-    fn build_orders_tests() {
-        let config = Config {
-            increment: 10,
-            order_size: 100,
-            min_order_size: 10,
-            max_buy_price: 1000,
-            min_sell_price: 500,
-            max_orders_per_direction: 10,
-            max_orders_to_make_per_iteration: 10,
-            max_orders_to_cancel_per_iteration: 10,
-            iteration_interval: Duration::from_secs(1),
-        };
-    }
 
     #[test_case(100, 10, 90)]
     #[test_case(1001, 100, 900)]
